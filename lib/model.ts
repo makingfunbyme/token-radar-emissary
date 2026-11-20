@@ -77,33 +77,75 @@ const templates: Record<string, [string, string, string]> = {
   Chain: ['fund a wallet with a small amount of the chain’s native gas asset and test a transfer', 'verify finality and the return route', 'withdrawal delays and bridge liquidity'],
 };
 
-function farm(p: Protocol) {
+const layerTwos = new Set([
+  'ApeChain', 'Arbitrum', 'Base', 'Blast', 'BOB', 'Bitlayer', 'BSquared', 'Celo', 'Citrea', 'Corn',
+  'Fraxtal', 'Goat', 'Ink', 'Katana', 'Linea', 'Lisk', 'Manta', 'Mantle', 'MegaETH', 'MetalL2',
+  'Metis', 'Mode', 'Morph', 'Op_Bnb', 'Optimism', 'Polygon zkEVM', 'Reya Network', 'Robinhood Chain',
+  'Scroll', 'Soneium', 'Starknet', 'Taiko', 'Unichain', 'World Chain', 'X Layer', 'Zircuit', 'zkLink', 'zkSync Era',
+]);
+const positionDollars = new Intl.NumberFormat('en-US', {
+  style: 'currency', currency: 'USD', maximumFractionDigits: 0,
+});
+const usdFee = (value: number) => `$${value.toFixed(Number.isInteger(value) ? 0 : 2)}`;
+const feeRange = (low: number, high: number) =>
+  low === high ? usdFee(low) : `${usdFee(low)}–${usdFee(high)}`;
+
+function chainFees(chain: string): [number, number] {
+  if (chain === 'Ethereum') return [3, 15];
+  if (chain === 'Solana') return [0.01, 0.01];
+  if (layerTwos.has(chain)) return [0.05, 0.40];
+  return [0.02, 0.10];
+}
+
+function farm(p: Protocol & { age_days: number }) {
   const [action, review, risk] = templates[p.category] ??
     ['use a supported asset in the smallest reversible core action', 'check the balance and exit route', 'contract risk and withdrawal limits'];
-  const chain = p.chains[0] ?? 'a supported chain';
-  const capital = Math.round(clamp(Math.sqrt(p.tvl_usd / 5000), 25, 500) / 5) * 5;
-  const weeks = p.tvl_usd >= 100_000_000 ? '3–4 weeks' : '2–3 weeks';
-  const tx = chain === 'Ethereum' ? 5 : 1;
   const chains = [...new Set(p.chains)];
-  const routes = Math.min(4, chains.length);
+  const chain = chains[0] ?? 'a verified deployment';
+  const capital = [0.0005, 0.002].map(share => positionDollars.format(clamp(p.tvl_usd * share, 200, 25_000))).join('–');
+  const weeks = p.age_days < 90 ? [2, 3] : p.age_days < 365 ? [3, 4] : p.age_days < 730 ? [4, 5] : [4, 6];
+  const time_to_farm_days = `${weeks[0] * 7}–${weeks[1] * 7}`;
+  const feeGroups = new Map<string, string[]>();
+  const farm_chain_fees = chains.map(name => {
+    const fee = feeRange(...chainFees(name));
+    if (!feeGroups.has(fee)) feeGroups.set(fee, []);
+    feeGroups.get(fee)!.push(name);
+    return { chain: name, fee };
+  });
+  const feeSummary = [...feeGroups].map(([fee, names]) => {
+    const sample = names.slice(0, 4).join(', ');
+    return `${sample}${names.length > 4 ? ` + ${names.length - 4} more in the same fee band` : ''} ${fee}`;
+  }).join('; ');
+  const [low, high] = chainFees(chains[0] ?? '');
+  const est_monthly_cost_usd = feeRange(3 * low, 8 * high);
+  const change = p.change_7d == null ? 'no 7d TVL reading' :
+    `a ${p.change_7d >= 0 ? '+' : ''}${p.change_7d.toFixed(1)}% 7d TVL print`;
+  const caution = p.change_7d == null ? 'Get a fresh 7d TVL reading before sizing up.' :
+    p.change_7d <= -10 ? `With ${change}, wait for a flat or positive week before funding.` :
+    p.change_7d < 0 ? `With ${change}, start at the lower end once flows stabilize.` :
+    p.change_7d >= 20 ? `With ${change}, check whether a single incentive pool drove the inflow before renewing.` :
+    `With ${change}, check the live pool’s withdrawable liquidity before judging the trade on headline TVL.`;
   const steps = [
-    { time: '10–15 min', cost: '$0', text: `Verify the ${p.category} deployment on ${chain}, check its supported assets and quote a $${capital}–$${capital * 3} position. Skip deployments with unclear withdrawal terms.` },
-    ...(chains.length > 1 ? [{
+    { time: '10–15 min', cost: '$0', text: `Check the official ${p.name} ${p.category} deployment on ${chain} and confirm a live exit quote. Snapshot shows ${change}; skip entry at −10% or worse. Points status is unverified; count points only if published terms cover your wallet, chain and action.` },
+    { time: '10–25 min', cost: feeRange(low * 2, high * 3), text: `On ${chain}, ${action}. Work with ${capital} against ${money(p.tvl_usd)} protocol TVL (0.05–0.20%, bounded at $200–$25,000). Start small and check the exit before sizing up.` },
+    { time: '5–10 min', cost: '$0', text: `Budget gas per interaction: ${feeSummary || 'quote the chain first; no deployment is listed'}. On ${chain}, allow ${est_monthly_cost_usd} for 3–4 setup and exit interactions plus up to 4 weekly touches in a 30-day budget. Quote swap, bridge or withdrawal fees separately.` },
+    { time: `${weeks.join('–')} weeks`, cost: feeRange(0, high * 4), text: `Hold for ${weeks.join('–')} weeks (${time_to_farm_days} days); ${review} weekly. Touch on-chain only if the published rules require it. Stop adding and check the exit if TVL drops 10% from entry or you see ${risk}.` },
+    { time: '15–30 min', cost: feeRange(low, high), text: `Withdraw when the review ends or the stop trips, subject to the exit terms. Save receipts and net out fees. Watch official points announcements and any token claim window; log rewards only when claimable. ${caution}` },
+    ...(chains.length >= 3 ? [{
       time: '5–10 min', cost: '$0',
-      text: `Compare the ${chain} and ${chains[1]} deployments for liquidity, gas and exit terms. Proceed on ${chain} only if its terms suit the planned position.`,
+      text: `Before funding, compare exit quotes on ${chain} and ${chains[1]}. Across ${chains.length} listed chains, use one wallet and one deployment unless the rules explicitly credit activity across chains.`,
     }] : []),
-    { time: '10–25 min', cost: `$${tx}–$${tx * 5 + routes}`, text: `On ${chain}, ${action}. Set aside $${capital}–$${capital * 3} of capital and keep a separate gas balance for the exit.` },
-    { time: weeks, cost: '$0', text: `Monitor the recorded activity and ${review} once a week. Watch for ${risk}; reassess the exit if conditions worsen.` },
-    ...(p.change_7d != null && p.listed_at ? [{
+    ...(p.tvl_usd > 500_000_000 ? [{
       time: '5–10 min', cost: '$0',
-      text: `Record the snapshot’s ${p.change_7d.toFixed(1)}% weekly TVL change and ${p.listed_at} tracking start. Check whether recent flows changed liquidity or exit terms before renewing the position.`,
+      text: `Before committing to the upper size, check withdrawal capacity in the specific pool on ${chain}. The ${money(p.tvl_usd)} headline TVL spans the protocol; size down if the pool cannot quote your full exit.`,
     }] : []),
-    { time: '15–30 min', cost: `$${tx}–$${tx * 6 + routes}`, text: `Unwind on ${chain} when the review window ends, subject to any lockup. Record net fees and confirm the returned balance before closing the log.` },
   ];
   return {
     farm_steps: steps.map(s => `${s.text} Time: ${s.time}. Estimated cost: ${s.cost}.`),
     farm_details: steps,
-    farm_cost: `$${tx * 2}–$${tx * 11 + routes * 2}`,
+    farm_chain_fees,
+    est_monthly_cost_usd,
+    time_to_farm_days,
   };
 }
 
@@ -183,7 +225,7 @@ export function buildRadar(snapshot: Snapshot) {
 type Board = ReturnType<typeof buildRadar>['board'];
 
 export function boardIssue(board: Board, snapshot: Snapshot): string | null {
-  if (!Array.isArray(board) || board.length < 100 || board.length > 200) return 'Board must contain 100–200 rows';
+  if (!Array.isArray(board) || board.length < 100 || board.length > 4000) return 'Board must contain 100–4000 rows';
   const seen = new Set<string>();
   const watchlist = new Set(snapshot.watchlist);
   const candidates = new Map(snapshot.protocols.filter(isPreToken).map(p => [p.slug, p]));
@@ -198,7 +240,8 @@ export function boardIssue(board: Board, snapshot: Snapshot): string | null {
         row.implied_value_usd > CONSTANTS.maxValue || (index > 0 && row.implied_value_usd > board[index - 1].implied_value_usd)) {
       return `Invalid implied value: ${row.slug}`;
     }
-    if (!Array.isArray(row.farm_steps) || row.farm_steps.length < 4 || row.farm_steps.length > 6 ||
+    if (!Array.isArray(row.farm_steps) || row.farm_steps.length < 5 ||
+        row.farm_steps.length > 5 + Number(new Set(row.chains).size >= 3) + Number(row.tvl_usd > 500_000_000) ||
         row.farm_steps.some(step => typeof step !== 'string' || step.length < 20 || step.length > 600)) return `Invalid farm plan: ${row.slug}`;
   }
   return snapshot.watchlist.find(slug => !seen.has(slug)) ? 'Board is missing a watchlist protocol' : null;

@@ -11,7 +11,8 @@ const compact = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'U
 const dollars = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 const bands = [5e6, 50e6, 100e6, 500e6, 1e9];
 const bandLabels = ['$5M', '$50M', '$100M', '$500M', '$1B+'];
-const defaults = () => ({ search: '', categories: [], chains: [], confidence: '', age: '', min: -1, max: 5, watch: false });
+const valueBands = [0, 1e6, 5e6, 10e6, 25e6, 50e6, 100e6, 250e6, 500e6, 1e9, 2e9];
+const defaults = () => ({ search: '', categories: [], chains: [], confidence: '', age: '', min: -1, max: 5, implied: 0, watch: false });
 const state = { filters: defaults(), sort: 'rank', ascending: true, focus: '', shot: new URLSearchParams(location.search).get('shot') };
 const index = new Map(radar.board.map(row => [row.slug, row]));
 const field = name => form.elements.namedItem(name);
@@ -70,18 +71,20 @@ function renderExclusions() {
 
 function syncFilters() {
   const f = state.filters;
-  for (const key of ['search', 'confidence', 'age', 'min', 'max']) field(key).value = f[key];
+  for (const key of ['search', 'confidence', 'age', 'min', 'max', 'implied']) field(key).value = f[key];
   field('watch').checked = f.watch;
   for (const input of form.querySelectorAll('[data-group]')) input.checked = f[input.dataset.group].includes(input.value);
   renderRanges();
 }
 
 function renderRanges() {
-  const { min, max } = state.filters;
+  const { min, max, implied } = state.filters;
   byId('maxValue').textContent = max === bands.length ? 'Uncapped' : compact.format(bands[max]);
   byId('minValue').textContent = min < 0 ? 'Any' : bandLabels[min];
+  byId('impliedMinValue').textContent = implied ? compact.format(valueBands[implied]) : 'Any';
   field('min').setAttribute('aria-valuetext', byId('minValue').textContent);
   field('max').setAttribute('aria-valuetext', byId('maxValue').textContent);
+  field('implied').setAttribute('aria-valuetext', byId('impliedMinValue').textContent);
 }
 
 function renderChips() {
@@ -90,6 +93,7 @@ function renderChips() {
   for (const key of ['search', 'confidence', 'age']) if (f[key].trim()) chips.push([key, f[key].trim()]);
   if (f.min >= 0) chips.push(['min', `≥ ${compact.format(bands[f.min])}`]);
   if (f.max < bands.length) chips.push(['max', `≤ ${compact.format(bands[f.max])}`]);
+  if (f.implied) chips.push(['implied', `Implied ≥ ${compact.format(valueBands[f.implied])}`]);
   if (f.watch) chips.push(['watch', 'Watchlist only']);
   byId('chips').innerHTML = chips.map(([key, value]) =>
     `<button type="button" class="chip" data-key="${key}" data-value="${html(value)}" aria-label="Remove filter ${html(value)}">${html(value)} ×</button>`
@@ -106,6 +110,7 @@ function filteredRows() {
     (!f.confidence || f.confidence === row.confidence) &&
     (!f.age || f.age === row.age_label) &&
     (f.min < 0 || row.tvl_usd >= bands[f.min]) && (f.max === bands.length || row.tvl_usd <= bands[f.max]) &&
+    row.implied_value_usd >= valueBands[f.implied] &&
     (!f.watch || row.watchlist)
   ).sort((a, b) => (a[state.sort] - b[state.sort]) * (state.ascending ? 1 : -1) || a.rank - b.rank);
 }
@@ -114,10 +119,10 @@ function rowMarkup(row) {
   const tag = row.watchlist_override ? 'watchlist override' : row.watchlist ? 'watchlist'
     : row.tvl_usd < radar.meta.floor_usd ? 'below floor' : 'off watchlist';
   const dots = '<i></i>'.repeat(Math.min(row.chains.length, 4));
-  const top = row.rank <= 3 ? `top-${row.rank}` : '';
+  const top = row.rank <= 3 ? `top-${row.rank}` : row.rank <= 10 ? 'top-ten' : '';
   return `<tr data-slug="${html(row.slug)}" class="${top}">
     <td class="rank"><span>${String(row.rank).padStart(2, '0')}</span></td>
-    <td class="protocol"><button type="button" tabindex="${row.slug === state.focus ? 0 : -1}" aria-haspopup="dialog" title="${html(row.name)}">${html(row.name)}</button>
+    <td class="protocol"><button type="button" tabindex="${row.slug === state.focus ? 0 : -1}" aria-haspopup="dialog" aria-label="Open ${html(row.name)} details" title="${html(row.name)}">${html(row.name)}</button>
       <div class="protocol-meta"><span class="category">${html(row.category)}</span><span class="tag ${row.watchlist ? 'watch' : ''}">${tag}</span>
       <span class="dots" title="${html(row.chains.join(', '))}" aria-label="${row.chains.length} listed chains">${dots}${row.chains.length > 4 ? '+' : ''}</span></div>
     </td>
@@ -127,7 +132,7 @@ function rowMarkup(row) {
     <td><span class="confidence ${row.confidence}">${row.confidence}</span></td>
     <td class="value" title="${dollars.format(row.implied_value_usd)}">${compact.format(row.implied_value_usd)}
       <meter aria-label="Implied value relative to rank one" min="0" max="${radar.board[0].implied_value_usd}" value="${row.implied_value_usd}"></meter></td>
-    <td class="fees">${html(row.farm_cost)}</td>
+    <td class="fees">${html(row.est_monthly_cost_usd)}<small>${html(row.time_to_farm_days)} days</small></td>
   </tr>`;
 }
 
@@ -163,15 +168,28 @@ function openDetail(row) {
     ['Persistence', f.persistence, `${c.persistenceBase} + ${c.persistenceWeight} × ${Math.min(row.age_days, c.ageCap).toFixed(0)} / ${c.ageCap}`],
     ['Category factor', f.cat_mult, `${compact.format(cohort.median_tvl)} cohort median · n=${cohort.count}`],
   ];
+  const multipliers = factors.map(([, value]) => value.toFixed(6));
   byId('drawerLabel').textContent = 'Protocol detail';
   byId('detail').innerHTML = `
     <div class="detail-heading"><div><h2 id="drawerTitle">${html(row.name)}</h2><p>Rank #${row.rank} · ${html(row.category)} · ${row.confidence} confidence</p></div><div><span class="micro">Implied value</span><br><strong>${dollars.format(row.implied_value_usd)}</strong></div></div>
     <section class="detail-section"><h3>Value derivation</h3>
-      <div class="equation">${dollars.format(row.tvl_usd)} × ${factors.map(([, value]) => value.toFixed(6)).join(' × ')} ≈ ${dollars.format(row.implied_value_usd)}</div>
-      <div class="factors">${factors.map(([label, value, note]) => `<div class="factor"><span class="micro">${label}</span><b>${value.toFixed(4)}</b><small>${html(note)}</small></div>`).join('')}</div>
+      <div class="derivation">
+        <div class="factors" aria-label="Value factors on a shared scale from 0 to 1.5">
+          ${factors.map(([label, value, note]) => `<div class="factor"><div><span class="micro">${label}</span><b>${value.toFixed(4)}×</b></div>
+            <div class="factor-track" aria-hidden="true"><i style="--fill: ${value / 1.5 * 100}%"></i></div><small>${html(note)}</small></div>`).join('')}
+        </div>
+        <dl class="equation" aria-label="Step-by-step value calculation">
+          <div><dt>Protocol TVL</dt><dd>${dollars.format(row.tvl_usd)}</dd></div>
+          ${factors.map(([label], i) => `<div><dt>${label}</dt><dd>× ${multipliers[i]}</dd></div>`).join('')}
+          <div><dt>Implied value</dt><dd>≈ ${dollars.format(row.implied_value_usd)}</dd></div>
+        </dl>
+      </div>
     </section>
-    <section class="detail-section"><h3>Farm plan <span class="micro">· ${html(row.farm_cost)} estimated fees</span></h3>
+    <section class="detail-section"><div class="plan-heading"><h3>Farm plan</h3>
+      <button type="button" class="quiet" id="copyPlan" aria-label="Copy farm plan for ${html(row.name)}">Copy plan</button><span id="copyStatus" class="visually-hidden" role="status"></span></div>
+      <p class="farm-summary"><strong>${html(row.est_monthly_cost_usd)}</strong> estimated monthly gas <span aria-hidden="true">·</span> <strong>${html(row.time_to_farm_days)} days</strong> to farm</p>
       <ol class="plan">${row.farm_details.map((step, i) => `<li><span class="step-number" aria-hidden="true">${String(i + 1).padStart(2, '0')}</span><div>${html(step.text)}<div class="step-chips"><span>${html(step.time)}</span><span>${html(step.cost)} fees</span></div></div></li>`).join('')}</ol>
+      ${row.farm_chain_fees.length ? `<details class="chain-fees"><summary>Gas by chain · per interaction</summary>${dataGrid(row.farm_chain_fees.map(({ chain, fee }) => [chain, fee]))}</details>` : ''}
     </section>
     <section class="detail-section"><h3>Snapshot record</h3>${dataGrid([
       ['Slug', row.slug], ['Name', row.name], ['Category', row.category], ['Chains', row.chains.join(', ') || '—'],
@@ -180,6 +198,24 @@ function openDetail(row) {
     ])}</section>
     <section class="detail-section"><h3>Signals</h3><ul class="signals">${row.signals.map(signal => `<li>${html(signal)}</li>`).join('')}</ul></section>
     <p class="footnote">The snapshot records no token when CoinGecko ID, symbol, and market cap are all blank. Records can lag deployments and token listings. Modeled value and fee bands are estimates.</p>`;
+  const copy = byId('copyPlan');
+  const copyStatus = byId('copyStatus');
+  copy.addEventListener('click', async () => {
+    const plan = [
+      `${row.name} farm plan`,
+      `${row.est_monthly_cost_usd} estimated monthly gas · ${row.time_to_farm_days} days to farm`,
+      ...row.farm_steps.map((step, i) => `${i + 1}. ${step}`),
+      ...row.farm_chain_fees.map(({ chain, fee }) => `${chain} gas per interaction: ${fee}`),
+    ].join('\n');
+    try {
+      await navigator.clipboard.writeText(plan);
+      copy.textContent = 'Copied';
+      copyStatus.textContent = 'Farm plan copied.';
+    } catch {
+      copy.textContent = 'Copy failed';
+      copyStatus.textContent = 'Could not copy the farm plan.';
+    }
+  });
   drawer.showModal();
   drawer.scrollTop = 0;
 }
@@ -202,6 +238,9 @@ form.addEventListener('input', event => {
     f[group] = [...form.querySelectorAll(`[data-group="${group}"]:checked`)].map(option => option.value);
   } else if (input.name === 'watch') {
     f.watch = input.checked;
+  } else if (input.name === 'implied') {
+    f.implied = Number(input.value);
+    renderRanges();
   } else if (input.name === 'min' || input.name === 'max') {
     f[input.name] = Number(input.value);
     if (f.min > f.max) f[input.name === 'min' ? 'max' : 'min'] = Number(input.value);
@@ -259,6 +298,28 @@ tbody.addEventListener('keydown', event => {
 });
 byId('close').addEventListener('click', () => drawer.close());
 byId('methodButton').addEventListener('click', openMethod);
+document.addEventListener('keydown', event => {
+  if (event.key.toLowerCase() !== 'f' || event.altKey || event.ctrlKey || event.metaKey ||
+      drawer.open || event.target.closest('input, textarea, select, [contenteditable]')) return;
+  event.preventDefault();
+  byId('search').focus();
+});
+
+const density = byId('density');
+function syncDensity() {
+  const compactRows = !state.shot && new URLSearchParams(location.hash.slice(1)).get('density') === 'compact';
+  document.querySelector('.board').classList.toggle('compact-rows', compactRows);
+  density.setAttribute('aria-pressed', String(compactRows));
+  density.textContent = compactRows ? 'Compact' : 'Comfortable';
+}
+density.addEventListener('click', () => {
+  const hash = new URLSearchParams(location.hash.slice(1));
+  hash.set('density', density.getAttribute('aria-pressed') === 'true' ? 'comfortable' : 'compact');
+  history.replaceState(null, '', `#${hash}`);
+  syncDensity();
+});
+window.addEventListener('hashchange', syncDensity);
+syncDensity();
 
 renderHeader();
 renderOptions();
